@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,9 +6,7 @@ import math
 from einops import rearrange, repeat, einsum
 from torch_sparse import SparseTensor
 
-
 from mamba_ssm import Mamba as MambaOfficial
-
 
 class Mamba(nn.Module):
     """
@@ -33,8 +30,6 @@ class Mamba(nn.Module):
     
     def forward(self, x):
         return self.mamba(x)
-
-
 
 class GCN_mamba_liner(torch.nn.Module):
     """
@@ -98,12 +93,19 @@ class GCN_mamba_Net(torch.nn.Module):
         self.bn_2 = torch.nn.BatchNorm1d(args.d_model)
         self.lin2 = GCN_mamba_liner(args.d_model, dataset.num_classes, with_bias=args.bias)
         self.bn_3 = torch.nn.BatchNorm1d(args.d_model)
+
+        # لایه‌های اضافی برای VAE-like regularization (mean و log_var)
+        self.fc_mu = GCN_mamba_liner(args.d_model, args.d_model, with_bias=args.bias)  # برای mean
+        self.fc_logvar = GCN_mamba_liner(args.d_model, args.d_model, with_bias=args.bias)  # برای log_var
+
         self.reset_parameters()
 
     def reset_parameters(self):
         self.lin1.reset_parameters()
         self.lin2.reset_parameters()
         self.mamba.reset_parameters()
+        self.fc_mu.reset_parameters()
+        self.fc_logvar.reset_parameters()
 
     def forward(self, x, adj):
         x_input = x
@@ -136,11 +138,15 @@ class GCN_mamba_Net(torch.nn.Module):
         all_layers_output = F.dropout(all_layers_output, p=self.dropout, training=self.training)
         y = self.lin2(output)
 
-        return output, F.log_softmax(y, dim=-1)
+        # محاسبه mean و log_var
+        mu = self.fc_mu(output)
+        log_var = self.fc_logvar(output)
+        log_var = torch.clamp(log_var, -10, 10)  # جدید: clamp برای جلوگیری از exploding
 
+        return (mu, log_var), F.log_softmax(y, dim=-1)  # tuple برای VAE
 
 class GCN_mamba_block(torch.nn.Module):
-   
+    # بدون تغییر
     def __init__(self, args, dataset):
         super().__init__()
         self.args = args
@@ -198,7 +204,6 @@ class GCN_mamba_block(torch.nn.Module):
         y = y + u * D
         return y
 
-
 class RMSNorm(torch.nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
@@ -206,4 +211,3 @@ class RMSNorm(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(d_model))
     def forward(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-
