@@ -5,15 +5,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
 import math
-from einops import repeat, einsum
 from mamba_ssm import Mamba
-from sklearn.metrics import roc_auc_score # <<< ADD THIS IMPORT
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics.pairwise import cosine_distances
 
-# This file contains the core logic from the classification paper's model.
-# We will import this into your main anomaly detection model.
+# ==========================================================================================
+# DEBUGGING UTILITIES
+# ==========================================================================================
+
+def log_activations(layer_output, epoch, mode):
+    """
+    Logs statistics of layer activations and saves a histogram.
+    """
+    try:
+        acts = layer_output.detach().cpu().numpy().flatten()
+        stats_text = (f"Epoch {epoch} | Mode: {mode} | Activations Stats -> "
+                      f"Mean: {acts.mean():.4f}, Std: {acts.std():.4f}, "
+                      f"Min: {acts.min():.4f}, Max: {acts.max():.4f}")
+        print(stats_text)
+        
+        plt.figure(figsize=(10, 6))
+        sns.histplot(acts, bins=50, kde=True)
+        plt.title(f"Activations Histogram - {mode.upper()} Mamba Epoch {epoch}")
+        plt.xlabel("Activation Value")
+        plt.ylabel("Frequency")
+        plt.savefig(f"acts_epoch_{epoch}_{mode}.png")
+        plt.close()
+        print(f"[DEBUG] Activation histogram saved to 'acts_epoch_{epoch}_{mode}.png'")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to log activations: {e}")
+
+def compute_mad(embeddings):
+    """
+    Computes the Mean Average Distance (MAD) using cosine distance.
+    """
+    if isinstance(embeddings, torch.Tensor):
+        embeddings = embeddings.detach().cpu().numpy()
+        
+    dists = cosine_distances(embeddings)
+    return dists.mean()
+
+# ==========================================================================================
+# MODULES
+# ==========================================================================================
 
 class GCN_mamba_liner(torch.nn.Module):
-    def __init__(self, in_features, out_features, with_bias=False):
+    def __init__(self, in_features, out_features, with_bias=True):
         super(GCN_mamba_liner, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -25,10 +64,9 @@ class GCN_mamba_liner(torch.nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
+        nn.init.kaiming_normal_(self.weight, a=0.1, mode='fan_in', nonlinearity='leaky_relu')
         if self.bias is not None:
-            self.bias.data.uniform_(-stdv, stdv)
+            nn.init.zeros_(self.bias)
 
     def forward(self, input):
         output = input @ self.weight
@@ -37,142 +75,93 @@ class GCN_mamba_liner(torch.nn.Module):
         else:
             return output
 
-class GCN_mamba_block(torch.nn.Module):
-    def __init__(self, args):
-        super(GCN_mamba_block, self).__init__()
-        self.args = args
-        self.x_proj = GCN_mamba_liner(args.d_inner, args.dt_rank + args.d_state * 2, with_bias=args.bias)
-        self.dropout = args.mamba_dropout
-        self.dt_proj = GCN_mamba_liner(args.dt_rank, args.d_inner, with_bias=args.bias)
-        A = repeat(torch.arange(1, args.d_state + 1), 'n -> d n', d=args.d_inner)
-        self.A_log = torch.nn.Parameter(torch.log(A))
-        self.D = torch.nn.Parameter(torch.ones(args.d_inner))
-        self.out_proj = GCN_mamba_liner(args.d_inner, args.d_model, with_bias=args.bias)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.x_proj.reset_parameters()
-        self.dt_proj.reset_parameters()
-        self.out_proj.reset_parameters()
+class SelectiveViewFusionBlock(nn.Module):
+    def __init__(self, args, tau=1.0, ablation_no_mamba=False):
+        super().__init__()
+        dim = args.d_model
+        
+        self.ablation_no_mamba = ablation_no_mamba
+        
+        if not self.ablation_no_mamba:
+            self.mamba = Mamba(d_model=dim, d_state=args.d_state, d_conv=4, expand=2)
+        
+        self.norm_in = nn.LayerNorm(dim)
+        self.norm_out = nn.LayerNorm(dim)
+        
+        self.proj_v1 = GCN_mamba_liner(dim, dim)
+        self.proj_v2 = GCN_mamba_liner(dim, dim)
+        
+        self.gate_fusion = GCN_mamba_liner(dim * 2, dim)
+        self.gate_nspl_logits = GCN_mamba_liner(dim, 2)
+        self.tau = tau
 
     def forward(self, x, adj):
-        alpha = 0.05
-        features = [x]
-        xi = x
-        for i in range(self.args.layer_num - 1):
-            xi = adj @ xi
-            xi = (1 - alpha) * xi + alpha * x
-            features.append(xi)
-        x_stacked = torch.stack(features, dim=0).transpose(0, 1)
-        y = self.ssm(x_stacked)
-        output = self.out_proj(y)
+        residual = x
+        x_norm = self.norm_in(x)
+        
+        nspl_logits = self.gate_nspl_logits(x_norm) 
+        nspl_gate = F.gumbel_softmax(nspl_logits, tau=self.tau, hard=True)[:, 1]
+        selective_adj = adj * nspl_gate.unsqueeze(1) * nspl_gate.unsqueeze(0)
+        
+        view1 = x_norm
+        if adj.is_sparse:
+            view2 = torch.sparse.mm(selective_adj, x_norm)
+        else:
+            view2 = torch.mm(selective_adj, x_norm)
+            
+        fusion_gate_input = torch.cat([view1, view2], dim=-1)
+        fusion_gate_values = torch.sigmoid(self.gate_fusion(fusion_gate_input))
+        fused_view = fusion_gate_values * self.proj_v1(view1) + (1 - fusion_gate_values) * self.proj_v2(view2)
+        
+        if self.ablation_no_mamba:
+            mamba_output = fused_view
+        else:
+            mamba_input = fused_view.unsqueeze(0)
+            mamba_output = self.mamba(mamba_input).squeeze(0)
+        
+        output = self.norm_out(mamba_output + residual)
         return output
 
-    def ssm(self, x):
-        (d_in, n) = self.A_log.shape
-        A = -torch.exp(self.A_log.float())
-        D = self.D.float()
-        x_dbl = self.x_proj(x)
-        x_dbl = F.relu(x_dbl)
-        x_dbl = F.dropout(x_dbl, p=self.dropout, training=self.training)
-        (delta, B, C) = x_dbl.split(split_size=[self.args.dt_rank, n, n], dim=-1)
-        delta = F.softplus(self.dt_proj(delta))
-        y = self.selective_scan(x, delta, A, B, C, D)
-        return y
-
-    def selective_scan(self, u, delta, A, B, C, D):
-        (b, l, d_in) = u.shape
-        n = A.shape[1]
-        deltaA = torch.exp(einsum(delta, A, 'b l d_in, d_in n -> b l d_in n'))
-        deltaB_u = einsum(delta, B, u, 'b l d_in, b l n, b l d_in -> b l d_in n')
-        x = torch.zeros((b, d_in, n), device=deltaA.device)
-        ys = []
-        for i in range(self.args.layer_num):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            y = einsum(x, C[:, i, :], 'b d_in n, b n -> b d_in')
-            ys.append(y)
-        y = torch.stack(ys, dim=1)
-        y = y + u * D
-        return y
-
-
-
-
-
 class GCN_mamba_Net_Encoder(torch.nn.Module):
-    def __init__(self, n_features, args, mode='local'):
+    def __init__(self, n_features, args, mode='local', ablation_no_mamba=False):
         super(GCN_mamba_Net_Encoder, self).__init__()
         self.dropout = args.mamba_dropout
         self.args = args
         self.mode = mode
         
-        print(f"\n--- GCN Mamba Encoder Initialized in '{self.mode.upper()}' Mode ---\n")
+        if ablation_no_mamba:
+            print("\n--- GCN Mamba Encoder Initialized in ABLATION MODE (NO MAMBA) ---\n")
+        else:
+            print(f"\n--- GCN Mamba Encoder Initialized in '{self.mode.upper()}' Mode (Full Model) ---\n")
 
-        # لایه‌های مشترک
         self.lin1 = GCN_mamba_liner(n_features, args.d_model, with_bias=args.bias)
         self.bn_2 = torch.nn.BatchNorm1d(args.d_model)
 
-        # لایه‌های مختص حالت Global
-        if self.mode == 'global':
-            self.mamba_global_attention = Mamba(
-                d_model=args.d_model, d_state=8, d_conv=4, expand=1
-            )
-        
-        # لایه‌های مختص حالت Local
         if self.mode == 'local':
-            self.bn_1 = torch.nn.BatchNorm1d(args.d_model)
-            self.mamba_local = GCN_mamba_block(args)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        self.lin1.reset_parameters()
-        if self.mode == 'local':
-            self.mamba_local.reset_parameters()
+            self.mamba_local = SelectiveViewFusionBlock(args, ablation_no_mamba=ablation_no_mamba)
+        elif self.mode == 'global':
+            self.mamba_global_attention = Mamba(d_model=args.d_model, d_state=8, d_conv=4, expand=1)
 
     def forward(self, x, adj, labels=None, epoch=-1):
-        # 1. تبدیل خطی اولیه (مشترک در همه حالت‌ها)
         x_input = self.lin1(x)
         
-        # --- انتخاب معماری بر اساس حالت ---
-        if self.mode == 'global':
-            global_attention_input = x_input.unsqueeze(0)
-            global_attention_input_flip = torch.flip(global_attention_input, dims=[1])
-            global_attention_output = self.mamba_global_attention(global_attention_input)
-            global_attention_output_flip = self.mamba_global_attention(global_attention_input_flip)
-            global_attention_output = global_attention_output + torch.flip(global_attention_output_flip, dims=[1])
+        if self.mode == 'local':
+            mamba_processed = self.mamba_local(x_input, adj)
+            output = F.dropout(mamba_processed, p=self.dropout, training=self.training)
+            output = self.bn_2(output)
             
-            output = F.relu(global_attention_output.squeeze(0))
-
-        elif self.mode == 'local':
-            x_local = self.bn_1(x_input)
-            x_local = F.relu(x_local)
-            x_local = F.dropout(x_local, p=self.dropout, training=self.training)
-            all_layers_output = self.mamba_local(x_local, adj)
-            local_output = all_layers_output[:, -1, :]
-            output = local_output
-
-        elif self.mode == 'linear':
-            output = x_input
-
-        else:
-            raise ValueError(f"Unknown encoder mode: {self.mode}")
+            if self.training and epoch != -1 and epoch % 50 == 0:
+                print(f"\n--- [DEBUG] Epoch {epoch}, Mode: {self.mode.upper()} ---")
+                print("[DEBUG] Logging activation statistics and histogram...")
+                log_activations(output.detach(), epoch, self.mode)
+                print("[DEBUG] Computing Mean Average Distance (MAD)...")
+                mad_input = compute_mad(x_input.detach())
+                mad_output = compute_mad(output.detach())
+                print(f"[DEBUG] MAD Input: {mad_input:.4f}, MAD Output: {mad_output:.4f}")
+                print("--- [END DEBUG] ---\n")
+            
+            return output, x_input
         
-        # --- لاگ‌گیری برای تحلیل ---
-        if self.training and epoch != -1 and epoch % 20 == 0:
-            with torch.no_grad():
-                base_norm = x_input.norm().item()
-                final_norm = output.norm().item()
-                print(
-                    f"  [Encoder Norms] Epoch: {epoch} | Mode: {self.mode.upper()} -> "
-                    f"Base Norm (after lin1): {base_norm:.3f}, "
-                    f"Final Output Norm: {final_norm:.3f}"
-                )
-        
-        # 4. Dropout و نرمال‌سازی نهایی
-        output = F.dropout(output, p=self.dropout, training=self.training)
+        output = F.dropout(x_input, p=self.dropout, training=self.training)
         output = self.bn_2(output)
-        
-        return output
-
+        return output, x_input
