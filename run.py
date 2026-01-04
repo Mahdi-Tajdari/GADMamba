@@ -1,171 +1,193 @@
-# run.py
-
-import torch
-import torch.nn as nn
-import numpy as np
-import scipy.sparse
-from sklearn.metrics import roc_auc_score
 import argparse
-from model import Dominant
-from utils import load_anomaly_detection_dataset
+import torch
+import torch.optim as optim
 import torch.nn.functional as F
+import numpy as np
+from sklearn.metrics import roc_auc_score
+import torch_geometric.utils as pyg_utils
+import random
 
-def grad_hook(module, grad_input, grad_output):
-    """
-    A backward hook to inspect gradients of a module.
-    """
-    print(f"--- [GRAD HOOK] Backward pass on {module.__class__.__name__} ---")
-    if grad_output and grad_output[0] is not None:
-        go = grad_output[0]
-        print(f"  Grad Output -> Mean: {go.mean():.6f}, Std: {go.std():.6f}, Norm: {go.norm():.6f}")
-    if grad_input and grad_input[0] is not None:
-        gi = grad_input[0]
-        print(f"  Grad Input  -> Mean: {gi.mean():.6f}, Std: {gi.std():.6f}, Norm: {gi.norm():.6f}")
-    print("--- [END GRAD HOOK] ---")
-    
-def loss_func(adj, A_hat, attrs, X_hat, alpha):
-    """
-    Calculates the reconstruction loss for attributes and structure.
-    """
-    diff_attribute = F.binary_cross_entropy_with_logits(X_hat, attrs, reduction='none')
-    attribute_reconstruction_errors = torch.sum(diff_attribute, 1)
-    attribute_cost = torch.mean(attribute_reconstruction_errors)
+# ایمپورت توابع از فایل‌های دیگر
+from utils import load_data, random_drop_edges, info_nce_loss
+from model import GCN_mamba_Net, SimpleGCN
 
-    diff_structure = torch.pow(A_hat - adj, 2)
-    structure_reconstruction_errors = torch.sqrt(torch.sum(diff_structure, 1))
-    structure_cost = torch.mean(structure_reconstruction_errors)
+# تنظیمات ورودی
+parser = argparse.ArgumentParser(description='Unsupervised Graph Anomaly Detection with Contrastive Mamba/GCN')
+parser.add_argument('--dataset', type=str, default='cora')
+parser.add_argument('--epochs', type=int, default=1500)
+parser.add_argument('--lr', type=float, default=0.001)
+parser.add_argument('--mamba_dropout', type=float, default=0.5)
+parser.add_argument('--d_model', type=int, default=128)
+parser.add_argument('--layer_num', type=int, default=5)
+parser.add_argument('--alpha', type=float, default=0.8)
+parser.add_argument('--graph_weight', type=float, default=0.9)
+parser.add_argument('--bias', action='store_true')
+parser.add_argument('--drop_rate1', type=float, default=0.1)
+parser.add_argument('--drop_rate2', type=float, default=0.15)
+parser.add_argument('--temperature', type=float, default=0.07)
+parser.add_argument('--device', type=int, default=0)
+parser.add_argument('--score_alpha', type=float, default=0.5, help='Weight for combining structural and attribute scores (0 to 1).')
+parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
 
-    cost = alpha * attribute_reconstruction_errors + (1 - alpha) * structure_reconstruction_errors
-    
-    return cost, structure_cost, attribute_cost
+# پارامترهای داخلی Mamba
+parser.add_argument('--d_inner', type=int, default=512)
+parser.add_argument('--dt_rank', type=int, default=4)
+parser.add_argument('--d_state', type=int, default=64)
+parser.add_argument('--d_conv', type=int, default=4)
+parser.add_argument('--expand', type=int, default=2)
 
-def spectral_loss(H, adj, anomaly_scores):
-    """
-    Calculates a numerically stable spectral loss.
-    """
-    H_norm = F.normalize(H, p=2, dim=1)
-    
-    D = torch.diag(adj.sum(1))
-    L = D - adj
-    
-    laplacian_signal = L @ H_norm
-    per_node_frequency = torch.sum(laplacian_signal * H_norm, dim=1)
-    
-    normalized_scores = F.softmax(anomaly_scores.detach(), dim=0)
-    
-    weighted_frequency = (per_node_frequency * normalized_scores).sum()
-    
-    return -weighted_frequency
+# انتخاب نوع مدل
+parser.add_argument('--model_type', type=str, default='gcn_mamba', choices=['gcn_mamba', 'simple_gcn'])
+args = parser.parse_args()
 
-def train_dominant(args):
-    adj, attrs, label, adj_label = load_anomaly_detection_dataset(args.dataset)
-    
-    if isinstance(adj, scipy.sparse.spmatrix):
-        adj = adj.toarray()
-    
-    adj_tensor = torch.FloatTensor(adj)
-    adj_label_tensor = torch.FloatTensor(adj_label)
-    attrs_tensor = torch.FloatTensor(attrs)
-    
-    numpy_labels = label 
+# تنظیم random seed
+seed = args.seed
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    mamba_args = argparse.Namespace()
-    mamba_args.d_model = args.d_model
-    mamba_args.d_state = args.d_state
-    mamba_args.bias = args.bias
-    mamba_args.d_inner = args.d_inner
-    mamba_args.dt_rank = args.dt_rank
-    mamba_args.layer_num = args.layer_num
-    mamba_args.mamba_dropout = args.mamba_dropout
+# تنظیم دستگاه پردازشی
+device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
+print(f'--- Running {args.model_type} on {args.dataset} with score_alpha={args.score_alpha} and seed={args.seed} ---')
 
-    model = Dominant(feat_size=attrs_tensor.size(1), 
-                     dropout=args.dropout, 
-                     mamba_args=mamba_args,
-                     encoder_mode=args.encoder_mode,
-                     ablation_no_mamba=args.ablation_no_mamba)
-                     
-    device = torch.device('cuda' if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
-    model = model.to(device)
-    adj_tensor = adj_tensor.to(device)
-    adj_label_tensor = adj_label_tensor.to(device)
-    attrs_tensor = attrs_tensor.to(device)
+# بارگذاری داده‌ها
+pyg_data, adj_dense, ano_label = load_data(args.dataset)
+pyg_data = pyg_data.to(device)
+adj_t = adj_dense.to(device)
+normal_mask = (pyg_data.y == 0)
+
+# تعریف مدل
+if args.model_type == 'gcn_mamba':
+    model = GCN_mamba_Net(pyg_data, args).to(device)
+elif args.model_type == 'simple_gcn':
+    model = SimpleGCN(pyg_data.num_features, args.d_model).to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+def train():
+    model.train()
+    optimizer.zero_grad()
     
-    if args.debug_grads and args.encoder_mode == 'local' and not args.ablation_no_mamba:
-        try:
-            mamba_module = model.shared_encoder.encoder.mamba_local.mamba
-            mamba_module.register_full_backward_hook(grad_hook)
-            print("\n[INFO] FULL backward hook registered on the Mamba module.\n")
-        except AttributeError:
-            print("\n[WARNING] Could not register backward hook.\n")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    for epoch in range(args.epoch):
-        model.train()
-        optimizer.zero_grad()
+    if args.model_type == 'gcn_mamba':
+        view1_adj = random_drop_edges(adj_t, args.drop_rate1)
+        view2_adj = random_drop_edges(adj_t, args.drop_rate2)
+        sub_mask = normal_mask.to(device)
+        emb1, _, _, _ = model(pyg_data.x[sub_mask], view1_adj[sub_mask][:, sub_mask])
+        emb2, _, _, _ = model(pyg_data.x[sub_mask], view2_adj[sub_mask][:, sub_mask])
         
-        encoded_features, _ = model.shared_encoder(attrs_tensor, adj_tensor, labels=numpy_labels, epoch=epoch)
-        
-        x_hat = model.attr_decoder(encoded_features, adj_tensor)
-        struct_reconstructed = model.struct_decoder(encoded_features)
-        
-        recon_loss_per_node, _, _ = loss_func(adj_label_tensor, struct_reconstructed, attrs_tensor, x_hat, args.alpha)
-        
-        reconstruction_loss = torch.mean(recon_loss_per_node)
-        spec_loss = spectral_loss(encoded_features, adj_tensor, recon_loss_per_node)
-        
-        total_loss = reconstruction_loss + args.spectral_weight * spec_loss
-        
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()        
-        
-        if epoch % 10 == 0:
-            print(f"Epoch: {epoch:04d}, total_loss={total_loss.item():.5f}, "
-                  f"recon_loss={reconstruction_loss.item():.5f}, spec_loss={spec_loss.item():.5f}")
+    elif args.model_type == 'simple_gcn':
+        sub_x = pyg_data.x[normal_mask]
+        sub_edge_index, _ = pyg_utils.subgraph(normal_mask, pyg_data.edge_index, relabel_nodes=True)
+        view1_edge = pyg_utils.dropout_edge(sub_edge_index, p=args.drop_rate1)[0]
+        view2_edge = pyg_utils.dropout_edge(sub_edge_index, p=args.drop_rate2)[0]
+        emb1, _, _, _ = model(sub_x, view1_edge)
+        emb2, _, _, _ = model(sub_x, view2_edge)
+    
+    loss = info_nce_loss(emb1, emb2, args.temperature)
+    loss.backward()
+    
+    total_grad_norm = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_grad_norm += param_norm.item() ** 2
+    total_grad_norm = total_grad_norm ** 0.5
 
-            model.eval()
-            with torch.no_grad():
-                final_features, pre_mamba_features = model.shared_encoder(attrs_tensor, adj_tensor)
+    optimizer.step()
+    return loss.item(), emb1, emb2, total_grad_norm
 
-                x_hat_final = model.attr_decoder(final_features, adj_tensor)
-                struct_final = model.struct_decoder(final_features)
-                val_loss_final, _, _ = loss_func(adj_label_tensor, struct_final, attrs_tensor, x_hat_final, args.alpha)
-                score_final = val_loss_final.cpu().numpy()
+# <--- UPDATED EVALUATE FUNCTION ---
+def evaluate():
+    model.eval()
+    with torch.no_grad():
+        if args.model_type == 'gcn_mamba':
+            final_emb, x_proj, global_emb, local_emb = model(pyg_data.x, adj_t)
+        elif args.model_type == 'simple_gcn':
+            final_emb, x_proj, global_emb, local_emb = model(pyg_data.x, pyg_data.edge_index)
+        
+        y_true = pyg_data.y.cpu().numpy()
 
-                x_hat_ablation = model.attr_decoder(pre_mamba_features, adj_tensor)
-                struct_ablation = model.struct_decoder(pre_mamba_features)
-                val_loss_ablation, _, _ = loss_func(adj_label_tensor, struct_ablation, attrs_tensor, x_hat_ablation, args.alpha)
-                score_ablation = val_loss_ablation.cpu().numpy()
+        # تابع کمکی برای محاسبه امتیاز و AUC برای هر embedding
+        def get_stats(emb, x_proj, adj_t, y_true, score_alpha):
+            if emb is None or torch.isnan(emb).any() or torch.isinf(emb).any():
+                return 0.0, None, None, None
+            
+            recon = adj_t @ emb
+            structural_scores = (recon - emb).norm(dim=1)
+            attribute_scores = (emb - x_proj).norm(dim=1)
+            scores = score_alpha * structural_scores - (1 - score_alpha) * attribute_scores
+            
+            if torch.isnan(scores).any() or torch.isinf(scores).any():
+                scores = torch.nan_to_num(scores, nan=0.0)
+            
+            y_scores = scores.cpu().numpy()
+            try:
+                auc = roc_auc_score(y_true, y_scores)
+            except ValueError:
+                auc = 0.0
+            return auc, scores, structural_scores, attribute_scores
 
-                try:
-                    auc_final = roc_auc_score(label, score_final)
-                    auc_ablation = roc_auc_score(label, score_ablation)
-                    print(f"Epoch: {epoch:04d}, AUC (Final): {auc_final:.4f}, AUC (Ablation/Pre-Mamba): {auc_ablation:.4f}")
-                except ValueError:
-                    print(f"Epoch: {epoch:04d}, AUC calculation failed.")
+        # محاسبه آمار برای embedding نهایی
+        auc_final, scores_final, struct_scores_final, attr_scores_final = get_stats(final_emb, x_proj, adj_t, y_true, args.score_alpha)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', default='BlogCatalog', help='Dataset name')
-    parser.add_argument('--epoch', type=int, default=400, help='Training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout for decoders')
-    parser.add_argument('--alpha', type=float, default=0.8, help='Balance parameter for reconstruction losses')
-    parser.add_argument('--weight_decay', type=float, default=1e-5, help='AdamW weight decay')
-    parser.add_argument('--device', default='cuda', type=str, help='cuda/cpu')
-    parser.add_argument('--d_model', type=int, default=64, help='Mamba model dimension')
-    parser.add_argument('--d_state', type=int, default=16, help='Mamba state dimension')
-    parser.add_argument('--spectral_weight', type=float, default=0.05, help='Weight for the spectral guidance loss.')
-    parser.add_argument('--bias', action='store_true', help='Use bias in linear layers')
-    parser.add_argument('--encoder_mode', type=str, default='local', choices=['linear', 'local', 'global'])
-    parser.add_argument('--debug_grads', action='store_true', help='Enable gradient hook for debugging.')
-    parser.add_argument('--ablation_no_mamba', action='store_true', help="Run without the Mamba core to test other mechanisms.")
-    parser.add_argument('--d_inner', type=int, default=64)
-    parser.add_argument('--dt_rank', type=int, default=32)
-    parser.add_argument('--layer_num', type=int, default=3)
-    parser.add_argument('--mamba_dropout', type=float, default=0.2)
+        # محاسبه آمار برای بخش‌های مجزا (Ablation)
+        ablation_aucs = {}
+        if args.model_type == 'gcn_mamba':
+            ablation_aucs['global'] = get_stats(global_emb, x_proj, adj_t, y_true, args.score_alpha)[0]
+            ablation_aucs['local'] = get_stats(local_emb, x_proj, adj_t, y_true, args.score_alpha)[0]
+        
+    return auc_final, scores_final, final_emb, struct_scores_final, attr_scores_final, ablation_aucs
 
-    args = parser.parse_args()
-    print(args)
-    train_dominant(args)
+# <--- UPDATED TRAINING LOOP WITH NEW LOGS ---
+for epoch in range(args.epochs):
+    loss, emb1, emb2, grad_norm = train()
+    
+    if epoch % 10 == 0:
+        # دریافت مقادیر جدید از تابع evaluate
+        auc, scores, final_emb, structural_scores, attribute_scores, ablation_aucs = evaluate()
+        
+        # --- [NEW LOGGING]: نمایش AUCهای مجزا ---
+        ablation_log = ""
+        if ablation_aucs:
+            global_auc = ablation_aucs.get('global', 0.0)
+            local_auc = ablation_aucs.get('local', 0.0)
+            ablation_log = f"| Ablation AUCs (Global/Local): {global_auc:.4f}/{local_auc:.4f}"
+
+        print("-" * 80)
+        print(f'Epoch {epoch:03d} | Loss: {loss:.4f} | Final AUC: {auc:.4f} {ablation_log} | Grad Norm: {grad_norm:.4f}')
+
+        if final_emb is None:
+            print("!!! ارزیابی به دلیل وجود NaN متوقف شد. !!!")
+            continue
+
+        # ... (بقیه لاگ‌ها بدون تغییر باقی می‌مانند)
+        with torch.no_grad():
+            pos_sim = torch.mm(F.normalize(emb1), F.normalize(emb2).t()).diag().mean().item()
+            print(f'  [Contrastive Health]: Positive Pair Similarity: {pos_sim:.4f}')
+            
+            emb_norm_train = emb1.norm(dim=1).mean().item()
+            emb_norm_eval = final_emb.norm(dim=1).mean().item()
+            print(f'  [Embedding Health]: Avg Norm (Train): {emb_norm_train:.4f} | Avg Norm (Eval): {emb_norm_eval:.4f}')
+
+            if scores is not None and len(scores) > 0 :
+                normal_scores_final = scores[normal_mask].cpu().numpy()
+                anomaly_scores_final = scores[~normal_mask].cpu().numpy()
+                
+                if len(normal_scores_final) > 0 and len(anomaly_scores_final) > 0:
+                    print(f'  [Anomaly Score (Final)]: Mean(N): {np.mean(normal_scores_final):.4f}, Mean(A): {np.mean(anomaly_scores_final):.4f}')
+            else:
+                print("  [Scores]: تعداد نمونه برای مقایسه امتیازها کافی نیست.")
+        print("-" * 80)
+
+final_auc, _, _, _, _, final_ablation_aucs = evaluate()
+print("-" * 50)
+print(f'Final Result - Dataset: {args.dataset} | Model: {args.model_type}')
+print(f'Final AUC: {final_auc:.4f}')
+if final_ablation_aucs:
+    print(f"Final Ablation AUCs -> Global Mamba: {final_ablation_aucs.get('global', 0.0):.4f}, Local Mamba: {final_ablation_aucs.get('local', 0.0):.4f}")
+print("-" * 50)
